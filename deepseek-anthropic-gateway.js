@@ -3,23 +3,42 @@ const http = require("http");
 const PORT = Number(process.env.PORT || 8787);
 const HOST = "127.0.0.1";
 const UPSTREAM = "https://api.deepseek.com/anthropic";
-const TARGET_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4.1-pro";
 const API_KEY = process.env.DEEPSEEK_API_KEY;
 
-// Updated mappings pointing to latest DeepSeek V4.1 Flash and Pro releases
-const MODEL_MAP = {
-  // Pro models
-  "claude-3-7-sonnet-20250219": "deepseek-v4.1-pro",
-  "claude-3-5-sonnet-20241022": "deepseek-v4.1-pro",
-  "claude-3-5-sonnet-20240620": "deepseek-v4.1-pro",
-  "claude-3-opus-20240229": "deepseek-v4.1-pro",
-  "claude-sonnet-4-5": "deepseek-v4.1-pro",
-  "claude-opus-4-5": "deepseek-v4.1-pro",
+// Official DeepSeek model names (as of docs)
+const DEEPSEEK_FLASH = "deepseek-flash";
+const DEEPSEEK_PRO = "deepseek-v4-pro";
 
-  // Flash models
-  "claude-3-5-haiku-20241022": "deepseek-v4.1-flash",
-  "claude-haiku-4-5": "deepseek-v4.1-flash"
-};
+// Official Anthropic model mapping rules:
+// claude-opus*   -> deepseek-v4-pro
+// claude-haiku*  -> deepseek-flash
+// claude-sonnet* -> deepseek-flash
+function mapClaudeModelToDeepSeek(requestedModel) {
+  if (typeof requestedModel !== "string") return DEEPSEEK_FLASH;
+
+  const lower = requestedModel.toLowerCase();
+
+  // Allow direct DeepSeek model names to pass through
+  if (lower === DEEPSEEK_FLASH || lower === DEEPSEEK_PRO) {
+    return lower;
+  }
+
+  // Official Claude model mappings
+  if (lower.startsWith("claude-opus")) {
+    return DEEPSEEK_PRO;
+  }
+  if (lower.startsWith("claude-haiku") || lower.startsWith("claude-sonnet")) {
+    return DEEPSEEK_FLASH;
+  }
+
+  // Any other unsupported claude* model falls back to flash per official docs
+  if (lower.startsWith("claude")) {
+    return DEEPSEEK_FLASH;
+  }
+
+  // Unknown non-claude model names: pass through and let upstream decide (or return 400)
+  return requestedModel;
+}
 
 if (!API_KEY) {
   console.error("Missing DEEPSEEK_API_KEY. Set it before starting this gateway.");
@@ -30,9 +49,7 @@ function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
     req.setEncoding("utf8");
-    req.on("data", chunk => {
-      raw += chunk;
-    });
+    req.on("data", chunk => { raw += chunk; });
     req.on("end", () => resolve(raw));
     req.on("error", reject);
   });
@@ -41,7 +58,6 @@ function readRequestBody(req) {
 function normalizeSystemContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
-
   return content
     .filter(block => block && block.type === "text" && typeof block.text === "string")
     .map(block => block.text)
@@ -59,14 +75,7 @@ function cleanContent(content) {
     })
     .map(block => {
       if (!block || typeof block !== "object") return block;
-
-      const {
-        thinking,
-        signature,
-        redacted_thinking,
-        ...cleanedBlock
-      } = block;
-
+      const { thinking, signature, redacted_thinking, ...cleanedBlock } = block;
       return cleanedBlock;
     });
 
@@ -86,17 +95,9 @@ function normalizeAnthropicRequest(body) {
       systemParts.push(normalizeSystemContent(message.content));
       continue;
     }
+    if (message.role !== "user" && message.role !== "assistant") continue;
 
-    if (message.role !== "user" && message.role !== "assistant") {
-      continue;
-    }
-
-    const {
-      thinking,
-      signature,
-      ...cleanedMessage
-    } = message;
-
+    const { thinking, signature, ...cleanedMessage } = message;
     messages.push({
       ...cleanedMessage,
       content: cleanContent(message.content)
@@ -104,7 +105,7 @@ function normalizeAnthropicRequest(body) {
   }
 
   const requestedModel = body.model || "unknown";
-  const mappedModel = process.env.DEEPSEEK_MODEL || MODEL_MAP[requestedModel] || TARGET_MODEL;
+  const mappedModel = mapClaudeModelToDeepSeek(requestedModel);
 
   const normalized = {
     ...body,
@@ -118,6 +119,8 @@ function normalizeAnthropicRequest(body) {
     delete normalized.system;
   }
 
+  // DeepSeek Anthropic endpoint supports thinking enabled/disabled,
+  // but not Anthropic's adaptive/thinking block structure for Claude
   delete normalized.thinking;
   delete normalized.output_config;
 
@@ -144,7 +147,6 @@ async function proxyMessages(req, res) {
     body: JSON.stringify(normalized)
   });
 
-  // Log exact model breakdown to console for every incoming call
   const timestamp = new Date().toISOString();
   console.log(
     `[${timestamp}] HTTP ${upstreamRes.status} | Client Requested: "${requestedModel}" | DeepSeek Model Used: "${mappedModel}"`
@@ -152,7 +154,6 @@ async function proxyMessages(req, res) {
 
   const headers = {
     "content-type": upstreamRes.headers.get("content-type") || "application/json; charset=utf-8",
-    // Attach custom headers so client/proxy inspectors can verify exact model used
     "x-gateway-client-model": requestedModel,
     "x-gateway-deepseek-model": mappedModel
   };
@@ -184,19 +185,14 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, {
         data: [
           {
-            id: "claude-3-7-sonnet-20250219",
+            id: "claude-sonnet-4-5",
             type: "model",
-            display_name: "DeepSeek V4.1 Pro"
+            display_name: "DeepSeek Flash (via Sonnet mapping)"
           },
           {
-            id: "claude-3-5-sonnet-20241022",
+            id: "claude-opus-4-5",
             type: "model",
-            display_name: "DeepSeek V4.1 Pro"
-          },
-          {
-            id: "claude-3-5-haiku-20241022",
-            type: "model",
-            display_name: "DeepSeek V4.1 Flash"
+            display_name: "DeepSeek V4 Pro (via Opus mapping)"
           }
         ]
       });
@@ -216,8 +212,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`DeepSeek Anthropic gateway listening on http://${HOST}:${PORT}`);
-  console.log("Model mapping:");
-  for (const [from, to] of Object.entries(MODEL_MAP)) {
-    console.log(`  ${from} -> ${process.env.DEEPSEEK_MODEL || to}`);
-  }
+  console.log("Model mapping (official DeepSeek rules):");
+  console.log(`  claude-opus*   -> ${DEEPSEEK_PRO}`);
+  console.log(`  claude-sonnet* -> ${DEEPSEEK_FLASH}`);
+  console.log(`  claude-haiku*  -> ${DEEPSEEK_FLASH}`);
+  console.log(`  other claude*  -> ${DEEPSEEK_FLASH}`);
 });
